@@ -338,7 +338,7 @@ func handleQueryApp(app *BaseApp, path []string, req abci.RequestQuery) abci.Res
 
 			bz, err := codec.ProtoMarshalJSON(simRes)
 			if err != nil {
-				return sdkerrors.QueryResult(sdkerrors.Wrap(err, "failed to JSON encode simulation response"))
+				return sdkerrors.QueryResult(sdkerrors.Extend(err, "failed to JSON encode simulation response"))
 			}
 
 			return abci.ResponseQuery{

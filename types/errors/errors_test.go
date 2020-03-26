@@ -208,3 +208,29 @@ func TestWrappedUnwrapFail(t *testing.T) {
 	err := Extend(errTest2, Extend(errTest, "some random description").Error())
 	require.NotEqual(t, errTest, stdlib.Unwrap(err))
 }
+
+func TestExtendf(t *testing.T) {
+	tests := []struct {
+		name          string
+		err           error
+		format        string
+		args          []interface{}
+		wantNilErr    bool
+		wantErrString string
+	}{
+		{"nil", nil, "", []interface{}{}, true, ""},
+		{"no format", errors.New("error"), "", []interface{}{}, false, "error: "},
+		{"format and args", errors.New("error"), "%s %d", []interface{}{"code", -1}, false, "error: code -1"},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			err := Extendf(tt.err, tt.format, tt.args...)
+			if tt.wantNilErr {
+				require.Nil(t, err)
+				return
+			}
+			require.Equal(t, tt.wantErrString, err.Error())
+		})
+	}
+}
