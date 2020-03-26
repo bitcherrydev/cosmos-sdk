@@ -2,12 +2,16 @@ package baseapp
 
 import (
 	"bytes"
+	"crypto/sha1" // nolint: gosec
 	"encoding/binary"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/sanity-io/litter"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -16,6 +20,7 @@ import (
 	dbm "github.com/tendermint/tm-db"
 
 	"github.com/cosmos/cosmos-sdk/codec"
+	"github.com/cosmos/cosmos-sdk/snapshots"
 	"github.com/cosmos/cosmos-sdk/store/rootmulti"
 	store "github.com/cosmos/cosmos-sdk/store/types"
 	sdk "github.com/cosmos/cosmos-sdk/types"
@@ -66,6 +71,34 @@ func setupBaseApp(t *testing.T, options ...func(*BaseApp)) *BaseApp {
 	err := app.LoadLatestVersion(capKey1)
 	require.Nil(t, err)
 	return app
+}
+
+// simple one store baseapp with data and snapshots. Each block is 1 MB in size.
+func setupBaseAppWithSnapshots(t *testing.T, blocks uint, options ...func(*BaseApp)) (*BaseApp, func()) {
+	snapshotDir := os.TempDir()
+	snapshotStore, err := snapshots.NewStore(dbm.NewMemDB(), snapshotDir)
+	require.NoError(t, err)
+	teardown := func() {
+		os.RemoveAll(snapshotDir)
+	}
+
+	app := setupBaseApp(t, append(options,
+		SetSnapshotStore(snapshotStore),
+		SetSnapshotPolicy(1, 3))...)
+
+	for h := int64(1); h <= int64(blocks); h++ {
+		app.BeginBlock(abci.RequestBeginBlock{Header: abci.Header{Height: h}})
+		for tx := int64(0); tx < 1000; tx++ {
+			key := fmt.Sprintf("%v", h*1000+tx)
+			value := strings.Repeat("0123456789", 100)
+			resp := app.DeliverTx(abci.RequestDeliverTx{Tx: []byte(fmt.Sprintf("%v=%v", key, value))})
+			require.True(t, resp.IsOK(), "%v", resp.String())
+		}
+		app.Commit()
+		time.Sleep(20 * time.Millisecond) // wait for snapshot to be taken
+	}
+
+	return app, teardown
 }
 
 func TestMountStores(t *testing.T) {
@@ -1434,6 +1467,98 @@ func TestQuery(t *testing.T) {
 	app.Commit()
 	res = app.Query(query)
 	require.Equal(t, value, res.Value)
+}
+
+func TestListSnapshots(t *testing.T) {
+	app, teardown := setupBaseAppWithSnapshots(t, 5)
+	defer teardown()
+
+	resp := app.ListSnapshots(abci.RequestListSnapshots{})
+	assert.Equal(t, abci.ResponseListSnapshots{Snapshots: []*abci.Snapshot{
+		{Height: 5, Format: 1, Chunks: 1, Metadata: nil},
+		{Height: 4, Format: 1, Chunks: 1, Metadata: nil},
+		{Height: 3, Format: 1, Chunks: 1, Metadata: nil},
+	}}, resp)
+}
+
+func TestGetSnapshotChunk(t *testing.T) {
+	app, teardown := setupBaseAppWithSnapshots(t, 5)
+	defer teardown()
+
+	testcases := map[string]struct {
+		height      uint64
+		format      uint32
+		chunk       uint32
+		expectEmpty bool
+	}{
+		"Existing snapshot": {5, 1, 1, false},
+		"Missing height":    {100, 1, 1, true},
+		"Missing format":    {5, 2, 1, true},
+		"Missing chunk":     {5, 1, 2, true},
+		"Zero height":       {0, 1, 1, true},
+		"Zero format":       {5, 0, 1, true},
+		"Zero chunk":        {5, 1, 0, true},
+	}
+	for name, tc := range testcases {
+		tc := tc
+		t.Run(name, func(t *testing.T) {
+			resp := app.GetSnapshotChunk(abci.RequestGetSnapshotChunk{
+				Height: tc.height,
+				Format: tc.format,
+				Chunk:  tc.chunk,
+			})
+			if tc.expectEmpty {
+				assert.Equal(t, abci.ResponseGetSnapshotChunk{}, resp)
+				return
+			}
+			require.NotNil(t, resp.Chunk)
+			assert.Equal(t, tc.height, resp.Chunk.Height)
+			assert.Equal(t, tc.format, resp.Chunk.Format)
+			assert.Equal(t, tc.chunk, resp.Chunk.Chunk)
+			assert.NotEmpty(t, resp.Chunk.Data)
+			assert.NotEmpty(t, resp.Chunk.Checksum)
+			checksum := sha1.Sum(resp.Chunk.Data) // nolint: gosec
+			assert.Equal(t, resp.Chunk.Checksum, checksum[:])
+		})
+	}
+}
+
+func TestApplySnapshotChunk(t *testing.T) {
+	source, teardown := setupBaseAppWithSnapshots(t, 10)
+	defer teardown()
+
+	target, teardown := setupBaseAppWithSnapshots(t, 0)
+	defer teardown()
+
+	// Fetch latest snapshot to restore
+	respList := source.ListSnapshots(abci.RequestListSnapshots{})
+	require.NotEmpty(t, respList.Snapshots)
+	snapshot := respList.Snapshots[0]
+
+	// Make sure the snapshot has at least 3 chunks
+	//require.GreaterOrEqual(t, snapshot.Chunks, uint32(3), "Not enough snapshot chunks")
+
+	// Begin a snapshot restoration in the target
+	respOffer := target.OfferSnapshot(abci.RequestOfferSnapshot{Snapshot: snapshot})
+	require.True(t, respOffer.Accepted)
+
+	// Fetch each chunk from the source and apply it to the target
+	for chunk := uint32(1); chunk <= snapshot.Chunks; chunk++ {
+		respChunk := source.GetSnapshotChunk(abci.RequestGetSnapshotChunk{
+			Height: snapshot.Height,
+			Format: snapshot.Format,
+			Chunk:  chunk,
+		})
+		require.NotNil(t, respChunk.Chunk)
+		litter.Dump(len(respChunk.Chunk.Data))
+		respApply := target.ApplySnapshotChunk(abci.RequestApplySnapshotChunk{
+			Chunk: respChunk.Chunk,
+		})
+		require.True(t, respApply.Applied)
+	}
+
+	// The target should now have the same hash as the source
+	assert.Equal(t, source.LastCommitID(), target.LastCommitID())
 }
 
 // Test p2p filter queries
